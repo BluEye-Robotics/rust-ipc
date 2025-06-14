@@ -1,0 +1,8 @@
+[package]
+name = "ipc_lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+errno = "0.2"
+libc = "0.2"

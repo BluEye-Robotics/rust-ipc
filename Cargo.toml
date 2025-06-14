@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ipc_lib",
+    "writer",
+    "reader",
+]

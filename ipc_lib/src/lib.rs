@@ -1,8 +1,8 @@
 // ipc_lib/src/lib.rs
 
 use libc::{
-    c_void, close, ftruncate, mmap, munmap, off_t, shm_open, shm_unlink, MAP_FAILED,
-    MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE,
+    c_void, close, ftruncate, mmap, munmap, off_t, shm_open, shm_unlink, MAP_FAILED, MAP_SHARED,
+    O_CREAT, O_RDWR, PROT_READ, PROT_WRITE,
 };
 use std::ffi::CString;
 use std::mem::size_of;
@@ -22,15 +22,24 @@ fn last_errno() -> i32 {
     }
 }
 
+// Create enum with SUCCESS, EAGAIN, ENOMSG
+// Error codes for IPC operations
+#[derive(Debug)]
+pub enum IPCStatus {
+    Success,
+    EAgain,
+    ENomsg,
+}
+
 /// Simple RAII wrapper for shared memory mapping of type T
-pub struct IPC<T> {
+pub struct IPC<T: Copy> {
     ptr: *mut T,
     size: usize,
     name: CString,
     created: AtomicBool,
 }
 
-impl<T> IPC<T> {
+impl<T: Copy> IPC<T> {
     /// Create or open shared memory region named `name`
     /// If `create` is true, attempts to create and truncate
     pub fn new(name: &str) -> Result<Self, String> {
@@ -38,11 +47,11 @@ impl<T> IPC<T> {
         let mut create = false;
         let mut fd = unsafe { shm_open(cname.as_ptr(), O_RDWR, 0o666) };
 
-        if fd < 0{
+        if fd < 0 {
             fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_RDWR, 0o666) };
             create = true;
         }
-        
+
         if fd < 0 {
             return Err(format!("shm_open failed: errno {}", last_errno()));
         }
@@ -83,18 +92,25 @@ impl<T> IPC<T> {
         })
     }
 
-    /// Get mutable reference to shared struct
-    pub fn get(&self) -> &mut T {
-        unsafe { &mut *self.ptr }
+    pub fn get(&self, obj: &mut T) -> IPCStatus {
+        unsafe {
+            //obj*self.ptr
+            *obj = *self.ptr;
+        }
+        IPCStatus::Success
+    }
+
+    pub fn set(&self, obj: T) {
+        unsafe {
+            *self.ptr = obj;
+        }
     }
 }
 
-
-impl<T> Drop for IPC<T> {
+impl<T: Copy> Drop for IPC<T> {
     fn drop(&mut self) {
         unsafe {
             munmap(self.ptr as *mut c_void, self.size);
         }
     }
 }
- 

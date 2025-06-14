@@ -1,7 +1,7 @@
 use ipc_lib::IPC;
 
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Data {
     counter: u32,
     value: f32,
@@ -9,9 +9,11 @@ struct Data {
 
 fn main() {
     let shm = IPC::<Data>::new("/my_topic").unwrap();
-    let data = shm.get();
+    let data = Data {
+        counter: 3,
+        value: 3.14,
+    };
 
-    data.counter += 1;
-    data.value = 3.14;
+    shm.set(data);
     println!("Wrote: {:?}", data);
 }

@@ -1,7 +1,7 @@
 use ipc_lib::IPC;
 
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Data {
     counter: u32,
     value: f32,
@@ -9,8 +9,9 @@ struct Data {
 fn main() {
     match IPC::<Data>::new("/my_topic") {
         Ok(shm) => {
-            let data = shm.get();
-            println!("Read: {:?}", data);
+            let mut data = Data::default();
+            let success = shm.get(&mut data);
+            println!("Read Succes {:?}: {:?}", success, data);
         }
         Err(e) => {
             eprintln!("Failed to read shared memory: {}", e);

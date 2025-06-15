@@ -8,6 +8,7 @@ struct Data {
 }
 
 fn main() {
+    env_logger::init();
     let shm = IPC::<Data>::new("/my/topic").unwrap();
 
     let data = Data {

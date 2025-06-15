@@ -8,6 +8,7 @@ struct Data {
 }
 
 fn main() {
+    env_logger::init();
     match IPC::<Data>::new("/my/topic") {
         Ok(mut shm) => {
             let mut data = Data::default();

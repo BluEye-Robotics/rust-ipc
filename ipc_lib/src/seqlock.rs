@@ -1,5 +1,6 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use log::{debug};
 
 #[cfg(target_arch = "x86_64")]
 const CACHELINE_BYTES: usize = 64;
@@ -36,26 +37,18 @@ pub struct SeqLockState {
 
 impl<T: Copy + Default> SeqLock<T> {
     pub fn write(&self, value: T) {
-        let mut seq1 = self.seq.load(Ordering::Relaxed);
-        seq1 = seq1.wrapping_add(1);
-        self.seq.store(seq1, Ordering::Release);
-
+        self.seq.fetch_add(1, Ordering::Release);
         unsafe {
             *self.entry.get() = value;
         }
-
-        seq1 = seq1.wrapping_add(1);
-        self.seq.store(seq1, Ordering::Release);
+        self.seq.fetch_add(1, Ordering::Release);
     }
 
     pub fn read(&self, state: &mut SeqLockState, always_update_entry: bool) -> Result<T, i32> {
-        println!("Reading from SeqLock...");
         loop {
-            let seq1 = self.seq.load(Ordering::Acquire);
-            println!("Attempting to read... {seq1}");
-
+            let seq1: u32 = self.seq.load(Ordering::Acquire);
             if seq1 & 1 != 0 {
-                println!("SeqLock is being written to, retrying...");
+                debug!("SeqLock is being written to, retrying...");
                 std::hint::spin_loop();
                 continue;
             }
@@ -64,7 +57,7 @@ impl<T: Copy + Default> SeqLock<T> {
 
             let seq2 = self.seq.load(Ordering::Acquire);
             if seq1 != seq2 {
-                println!("SeqLock read failed, seq mismatch: {seq1} != {seq2}");
+                debug!("SeqLock read failed, seq mismatch: {seq1} != {seq2}");
                 std::hint::spin_loop();
                 continue;
             }

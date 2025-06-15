@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 ipc_lib = { path = "../ipc_lib" }
+env_logger = "0.10"

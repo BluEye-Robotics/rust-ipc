@@ -7,7 +7,8 @@ use libc::{
 use std::ffi::CString;
 use std::mem::size_of;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+mod seqlock;
+use seqlock::{SeqLock, SeqLockState};
 
 /// Cross-platform errno getter
 fn last_errno() -> i32 {
@@ -32,21 +33,22 @@ pub enum IPCStatus {
 }
 
 /// Simple RAII wrapper for shared memory mapping of type T
-pub struct IPC<T: Copy> {
-    ptr: *mut T,
+pub struct IPC<T: Copy + Default> {
+    ptr: *mut SeqLock<T>,
+    state: SeqLockState,
     size: usize,
     name: CString,
-    created: AtomicBool,
 }
 
-impl<T: Copy> IPC<T> {
-    /// Create or open shared memory region named `name`
-    /// If `create` is true, attempts to create and truncate
+impl<T: Copy + Default> IPC<T> {
     pub fn new(name: &str) -> Result<Self, String> {
+        println!("Open shm topic {}", name);
+        let name = format!("/tyn_{}", name.trim_start_matches('/').replace('/', "%"));
+
         let cname = CString::new(name).map_err(|_| "Invalid shm name")?;
         let mut create = false;
         let mut fd = unsafe { shm_open(cname.as_ptr(), O_RDWR, 0o666) };
-
+        // Append PREFIX to the name to avoid conflicts
         if fd < 0 {
             fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_RDWR, 0o666) };
             create = true;
@@ -85,29 +87,35 @@ impl<T: Copy> IPC<T> {
         }
 
         Ok(Self {
-            ptr: ptr as *mut T,
+            ptr: ptr as *mut SeqLock<T>,
+            state: SeqLockState::default(),
             size: size as usize,
             name: cname,
-            created: AtomicBool::new(create),
         })
     }
 
-    pub fn get(&self, obj: &mut T) -> IPCStatus {
+    pub fn get(&mut self, obj: &mut T) -> IPCStatus {
         unsafe {
-            //obj*self.ptr
-            *obj = *self.ptr;
+            match (*self.ptr).read(&mut self.state, true) {
+                Ok(val) => {
+                    *obj = val;
+                    IPCStatus::Success
+                }
+                Err(libc::EAGAIN) => IPCStatus::EAgain,
+                Err(libc::ENOMSG) => IPCStatus::ENomsg,
+                Err(_) => IPCStatus::ENomsg, // fallback for other errors
+            }
         }
-        IPCStatus::Success
     }
 
-    pub fn set(&self, obj: T) {
+    pub fn set(&self, value: T) {
         unsafe {
-            *self.ptr = obj;
+            (*self.ptr).write(value);
         }
     }
 }
 
-impl<T: Copy> Drop for IPC<T> {
+impl<T: Copy + Default> Drop for IPC<T> {
     fn drop(&mut self) {
         unsafe {
             munmap(self.ptr as *mut c_void, self.size);

@@ -174,6 +174,42 @@ impl<T: Copy + Default> IPC<T> {
     }
 }
 
+/// Async polling API (requires the `tokio` feature).
+#[cfg(feature = "tokio")]
+impl<T: Copy + Default + Send + 'static> IPC<T> {
+    /// Create a tokio channel that receives new values as they appear on the IPC topic.
+    ///
+    /// Spawns an internal polling loop that checks for new data at the given `poll_interval`.
+    /// Returns a `tokio::sync::mpsc::Receiver<T>` that yields values whenever
+    /// `IPCStatus::Success` is returned.
+    ///
+    /// The polling stops when the receiver is dropped.
+    pub fn into_stream(
+        mut self,
+        poll_interval: std::time::Duration,
+        buffer: usize,
+    ) -> tokio::sync::mpsc::Receiver<T> {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer);
+
+        tokio::spawn(async move {
+            let mut obj = T::default();
+            loop {
+                match self.get(&mut obj) {
+                    IPCStatus::Success => {
+                        if tx.send(obj).await.is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        });
+
+        rx
+    }
+}
+
 impl<T: Copy + Default> Drop for IPC<T> {
     fn drop(&mut self) {
         unsafe {

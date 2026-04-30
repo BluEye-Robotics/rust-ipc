@@ -1,9 +1,18 @@
 [package]
 name = "ipc_lib"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 errno = "0.2"
 libc = "0.2"
 log = "0.4"
+
+[features]
+default = []
+tokio = ["dep:tokio"]
+
+[dependencies.tokio]
+version = "1"
+features = ["sync", "time", "rt"]
+optional = true

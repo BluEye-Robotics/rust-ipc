@@ -73,6 +73,16 @@ pub struct IPC<T: Copy + Default> {
     size: usize,
 }
 
+// SAFETY: The shared memory region pointed to by `ptr` is valid for the lifetime
+// of this struct (unmapped on Drop). The SeqLock uses proper atomic operations
+// (AtomicU32 with Acquire/Release ordering) for synchronization, making it safe
+// to access from any thread.
+unsafe impl<T: Copy + Default> Send for IPC<T> {}
+
+// SAFETY: The SeqLock provides synchronization via atomics. Write is safe for a
+// single writer (API contract), and reads are always safe (spin on odd seq).
+unsafe impl<T: Copy + Default> Sync for IPC<T> {}
+
 impl<T: Copy + Default> IPC<T> {
     /// Open or create a tyndall IPC topic.
     ///

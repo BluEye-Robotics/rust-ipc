@@ -45,6 +45,7 @@ impl<T: Copy + Default> SeqLock<T> {
     }
 
     pub fn read(&self, state: &mut SeqLockState, always_update_entry: bool) -> Result<T, i32> {
+        let mut entry = T::default();
         loop {
             let seq1: u32 = self.seq.load(Ordering::Acquire);
             if seq1 & 1 != 0 {
@@ -53,7 +54,9 @@ impl<T: Copy + Default> SeqLock<T> {
                 continue;
             }
 
-            let entry = unsafe { *self.entry.get() };
+            if seq1 != state.prev_seq || always_update_entry {
+                entry = unsafe { *self.entry.get() };
+            }
 
             let seq2 = self.seq.load(Ordering::Acquire);
             if seq1 != seq2 {
@@ -62,7 +65,7 @@ impl<T: Copy + Default> SeqLock<T> {
                 continue;
             }
 
-            if seq1 != state.prev_seq || always_update_entry {
+            if seq1 != state.prev_seq {
                 state.prev_seq = seq1;
                 state.has_read_once = true;
                 return Ok(entry);

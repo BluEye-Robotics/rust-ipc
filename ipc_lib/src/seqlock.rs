@@ -28,10 +28,11 @@
 //! post-#18 C++ reader disagree on every 64-bit target, and vice versa; the
 //! two sides have to move together, which is why this is a breaking version.
 //!
-//! The layout is pinned at compile time (the `const` assertions below, the
-//! Rust counterpart of tyndall's `tests/ipc/seq_lock_layout.cpp`), so
-//! `cargo check` for a target fails before a mismatching record can ever be
-//! written.
+//! The layout is pinned at compile time: the `const` assertions below (the
+//! Rust counterpart of tyndall's `tests/ipc/seq_lock_layout.cpp`) fail
+//! `cargo check` for a target whose ABI does not produce it, and the
+//! alignment guard on the storage type (tyndall's `static_assert`) fails the
+//! build of any program that opens a record over an over-aligned type.
 
 use std::cell::UnsafeCell;
 use std::mem::{align_of, offset_of, size_of};
@@ -67,7 +68,10 @@ struct CachelineAligned<T>(T);
 #[repr(C)]
 pub struct SeqLock<T: Copy + Default> {
     seq: AtomicU32,
-    size: usize,
+    /// `sizeof(STORAGE)`, stored by every write as tyndall's writer does
+    /// (its `ipc_read` tool reads it to know how much to print); no reader
+    /// depends on it.
+    size: UnsafeCell<usize>,
     entry: CachelineAligned<UnsafeCell<T>>,
 }
 
@@ -100,17 +104,31 @@ const _: () = {
 impl<T: Copy + Default> SeqLock<T> {
     /// tyndall's `static_assert(alignof(STORAGE) <= CACHELINE_BYTES)`: a
     /// storage type aligned beyond the cacheline would push `entry` past
-    /// offset `CACHELINE_BYTES` and off the C++ layout. Evaluated once the
-    /// storage type is known (referenced from `write` and `read`).
+    /// offset `CACHELINE_BYTES` and off the C++ layout. An associated const
+    /// of a generic type is evaluated when a use of it is compiled, so it is
+    /// referenced from every path that touches a record — [`Self::segment_size`]
+    /// (opening one), `write` and `read` — and fails the build of the
+    /// offending program (not `cargo check`, which does not instantiate
+    /// generics).
     const STORAGE_FITS_CACHELINE: () = assert!(
         align_of::<T>() <= CACHELINE_BYTES,
         "STORAGE alignment exceeds the cacheline; entry cannot be cacheline-isolated"
     );
 
+    /// The size of the shared-memory segment holding one record:
+    /// `sizeof(seq_lock<STORAGE>)`. The one way to size a segment, so that
+    /// merely opening a record over an over-aligned storage type trips the
+    /// guard, as instantiating tyndall's `shmem_buf` does its `static_assert`.
+    pub const fn segment_size() -> usize {
+        let () = Self::STORAGE_FITS_CACHELINE;
+        size_of::<Self>()
+    }
+
     pub fn write(&self, value: T) {
         let () = Self::STORAGE_FITS_CACHELINE;
         self.seq.fetch_add(1, Ordering::Release);
         unsafe {
+            *self.size.get() = size_of::<T>();
             *self.entry.0.get() = value;
         }
         self.seq.fetch_add(1, Ordering::Release);
@@ -251,6 +269,9 @@ mod tests {
         lock.write(value);
         assert_eq!(lock.read(&mut state, true), Ok(value));
         assert_eq!(lock.read(&mut state, true), Err(libc::EAGAIN));
+        // The writer stores sizeof(STORAGE), as tyndall's does.
+        assert_eq!(unsafe { *lock.size.get() }, size_of::<Vec3>());
+        assert_eq!(SeqLock::<Vec3>::segment_size(), size_of::<SeqLock<Vec3>>());
         // The entry sits where a C++ reader looks for it.
         let base = &lock as *const SeqLock<Vec3> as usize;
         let entry = lock.entry.0.get() as usize;

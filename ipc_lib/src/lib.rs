@@ -5,7 +5,6 @@ use libc::{
     O_RDWR, PROT_READ, PROT_WRITE,
 };
 use std::ffi::CString;
-use std::mem::size_of;
 use std::ptr::null_mut;
 mod seqlock;
 use seqlock::{SeqLock, SeqLockState};
@@ -107,7 +106,9 @@ impl<T: Copy + Default> IPC<T> {
             return Err(format!("shm_open failed: errno {}", last_errno()));
         }
 
-        let size = size_of::<SeqLock<T>>() as off_t;
+        // Through `segment_size`, not `size_of`: that is where the storage
+        // type's alignment guard is evaluated (see seqlock.rs).
+        let size = SeqLock::<T>::segment_size() as off_t;
 
         if create {
             let ret = unsafe { ftruncate(fd, size) };

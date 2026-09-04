@@ -1,4 +1,7 @@
 [workspace]
+# Every member is edition 2021, which implies this; stating it silences the
+# warning cargo prints on a virtual workspace that leaves it unset.
+resolver = "2"
 members = [
     "ipc_lib",
     "writer",

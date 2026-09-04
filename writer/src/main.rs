@@ -13,9 +13,9 @@ fn main() {
 
     let data = Data {
         counter: 3,
-        value: 3.14,
+        value: std::f32::consts::PI,
     };
 
     shm.set(data);
-    println!("Wrote: {:?}", data);
+    println!("Wrote: {data:?}");
 }

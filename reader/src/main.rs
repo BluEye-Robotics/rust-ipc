@@ -13,10 +13,10 @@ fn main() {
         Ok(mut shm) => {
             let mut data = Data::default();
             let success = shm.get(&mut data);
-            println!("Read Succes {:?}: {:?}", success, data);
+            println!("Read Succes {success:?}: {data:?}");
         }
         Err(e) => {
-            eprintln!("Failed to read shared memory: {}", e);
+            eprintln!("Failed to read shared memory: {e}");
         }
     }
 }

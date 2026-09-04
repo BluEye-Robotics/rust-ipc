@@ -58,7 +58,7 @@ fn fnv1a_32(data: &[u8]) -> u32 {
 fn topic_to_shm_name(topic: &str) -> String {
     let id = topic.trim_start_matches('/');
     let hash = fnv1a_32(id.as_bytes());
-    let name = format!("{}_{}_{}",IPC_SHMEM_PREFIX, id, hash);
+    let name = format!("{IPC_SHMEM_PREFIX}_{id}_{hash}");
     name.replace('/', "_")
 }
 
@@ -90,10 +90,10 @@ impl<T: Copy + Default> IPC<T> {
     /// a unique shared memory path in `/dev/shm/`.
     pub fn new(topic: &str) -> Result<Self, String> {
         let shm_name = topic_to_shm_name(topic);
-        log::info!("Opening IPC topic '{}' -> shm '/{}'", topic, shm_name);
+        log::info!("Opening IPC topic '{topic}' -> shm '/{shm_name}'");
 
         let cname =
-            CString::new(format!("/{}", shm_name)).map_err(|_| "Invalid shm name".to_string())?;
+            CString::new(format!("/{shm_name}")).map_err(|_| "Invalid shm name".to_string())?;
 
         let mut create = false;
         let mut fd = unsafe { shm_open(cname.as_ptr(), O_RDWR, 0o666) };
@@ -239,8 +239,14 @@ mod tests {
         assert!(!name.contains('/')); // no slashes in final name
 
         // Same topic with or without leading slash gives same name
-        assert_eq!(topic_to_shm_name("/my/topic"), topic_to_shm_name("my/topic"));
-        assert_eq!(topic_to_shm_name("//my/topic"), topic_to_shm_name("my/topic"));
+        assert_eq!(
+            topic_to_shm_name("/my/topic"),
+            topic_to_shm_name("my/topic")
+        );
+        assert_eq!(
+            topic_to_shm_name("//my/topic"),
+            topic_to_shm_name("my/topic")
+        );
 
         // Different topics with same underscore pattern get different hashes
         assert_ne!(topic_to_shm_name("my/topic"), topic_to_shm_name("my_topic"));

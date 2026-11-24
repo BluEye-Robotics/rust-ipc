@@ -1,13 +1,13 @@
 // ipc_lib/src/lib.rs
 
 use libc::{
-    c_void, close, ftruncate, mmap, munmap, off_t, shm_open, MAP_FAILED, MAP_SHARED, O_CREAT,
-    O_EXCL, O_RDWR, PROT_READ, PROT_WRITE,
+    c_int, c_void, close, fstat, ftruncate, mmap, munmap, off_t, shm_open, MAP_FAILED, MAP_SHARED,
+    O_CREAT, O_EXCL, O_RDWR, PROT_READ, PROT_WRITE,
 };
 use std::ffi::CString;
 use std::ptr::null_mut;
 mod seqlock;
-use seqlock::{SeqLock, SeqLockState};
+use seqlock::{SeqLock, SeqLockState, CACHELINE_BYTES};
 
 /// Cross-platform errno getter
 fn last_errno() -> i32 {
@@ -134,6 +134,51 @@ fn record_created_name(name: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Room for what tyndall's C++ keeps behind the record: the type hash and the
+/// debug format, which tyndall's `static_assert` keeps below one cacheline.
+const TYNDALL_TAILER_ROOM: usize = CACHELINE_BYTES;
+
+/// The size of the segment behind `fd`. macOS reports it rounded up to a page.
+fn segment_len(fd: c_int) -> Result<off_t, String> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { fstat(fd, &mut st) } != 0 {
+        return Err(format!("fstat failed: errno {}", last_errno()));
+    }
+    Ok(st.st_size)
+}
+
+/// Make sure the segment behind `fd` holds the `needed` bytes this process
+/// maps. `observed` is its size as this process last saw it. Returns whether
+/// this call sized the segment.
+///
+/// Every process that opens a segment does this, not only the one that made
+/// it, as tyndall's C++ does on Linux. Otherwise a process that opens the
+/// segment between its creator's `shm_open` and `ftruncate`, or after a
+/// creator died in between, maps a segment of size 0: `mmap` fails on macOS,
+/// and the first access raises SIGBUS on Linux.
+///
+/// The segment grows to `target`, which leaves room for tyndall's tailer, so
+/// sizing it late never cuts off a tailer that a C++ process has already
+/// written behind the record. macOS sizes a segment only once: when another
+/// process got there first, `ftruncate` fails, and the size it set decides.
+fn ensure_sized(fd: c_int, observed: off_t, needed: off_t, target: off_t) -> Result<bool, String> {
+    if observed >= needed {
+        return Ok(false);
+    }
+    if unsafe { ftruncate(fd, target) } == 0 {
+        return Ok(true);
+    }
+    let errno = last_errno();
+    let now = segment_len(fd)?;
+    if now >= needed {
+        Ok(false)
+    } else {
+        Err(format!(
+            "ftruncate failed: errno {errno}; the segment has {now} of {needed} bytes"
+        ))
+    }
+}
+
 /// Simple RAII wrapper for shared memory mapping of type T.
 ///
 /// Provides lock-free single-writer / multiple-reader IPC via a SeqLock
@@ -177,8 +222,7 @@ impl<T: Copy + Default> IPC<T> {
         );
 
         // O_EXCL, so that `create` is only true for the process that made the
-        // segment. Only that one sizes it (macOS refuses to resize a shm
-        // object) and may unlink it again on failure.
+        // segment. Only that one may unlink it again on failure.
         let mut create = true;
         let mut fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_EXCL | O_RDWR, 0o666) };
         if fd < 0 && last_errno() == libc::EEXIST {
@@ -192,18 +236,33 @@ impl<T: Copy + Default> IPC<T> {
 
         // Through `segment_size`, not `size_of`: that is where the storage
         // type's alignment guard is evaluated (see seqlock.rs).
-        let size = SeqLock::<T>::segment_size() as off_t;
+        let size = SeqLock::<T>::segment_size();
 
-        if create {
-            let ret = unsafe { ftruncate(fd, size) };
-            if ret < 0 {
+        let sized = segment_len(fd).and_then(|observed| {
+            ensure_sized(
+                fd,
+                observed,
+                size as off_t,
+                (size + TYNDALL_TAILER_ROOM) as off_t,
+            )
+        });
+        let sized = match sized {
+            Ok(sized) => sized,
+            Err(e) => {
                 unsafe {
-                    libc::shm_unlink(cname.as_ptr());
+                    if create {
+                        libc::shm_unlink(cname.as_ptr());
+                    }
                     close(fd);
                 }
-                return Err(format!("ftruncate failed: errno {}", last_errno()));
+                return Err(e);
             }
-            #[cfg(target_os = "macos")]
+        };
+
+        // A segment whose creator died before sizing it is recorded by the
+        // process that sized it.
+        #[cfg(target_os = "macos")]
+        if create || sized {
             if let Err(e) = record_created_name(cname.as_bytes()) {
                 log::warn!(
                     "Could not record '{}' for cleanup: {e}",
@@ -211,17 +270,10 @@ impl<T: Copy + Default> IPC<T> {
                 );
             }
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = sized;
 
-        let ptr = unsafe {
-            mmap(
-                null_mut(),
-                size as usize,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED,
-                fd,
-                0,
-            )
-        };
+        let ptr = unsafe { mmap(null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
 
         unsafe { close(fd) };
 
@@ -232,7 +284,7 @@ impl<T: Copy + Default> IPC<T> {
         Ok(Self {
             ptr: ptr as *mut SeqLock<T>,
             state: SeqLockState::default(),
-            size: size as usize,
+            size,
         })
     }
 
@@ -388,13 +440,107 @@ mod tests {
         drop(ipc);
         let cname = CString::new(name.clone()).unwrap();
         assert_eq!(unsafe { libc::shm_unlink(cname.as_ptr()) }, 0);
-        // Take the line out again, so tyndall's cleanup doesn't try it.
+        forget_recorded_name(&name);
+    }
+
+    /// Take a test's line out of tyndall's name list again, so that tyndall's
+    /// cleanup doesn't try it.
+    #[cfg(target_os = "macos")]
+    fn forget_recorded_name(name: &[u8]) {
+        let fd = std::fs::File::open(IPC_NAMES_FILE).unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) }, 0);
         let rest: Vec<u8> = std::fs::read(IPC_NAMES_FILE)
             .unwrap()
             .split(|&b| b == b'\n')
-            .filter(|line| !line.is_empty() && *line != name.as_slice())
+            .filter(|line| !line.is_empty() && *line != name)
             .flat_map(|line| line.iter().copied().chain([b'\n']))
             .collect();
         std::fs::write(IPC_NAMES_FILE, rest).unwrap();
+    }
+
+    /// A topic of its own for each test, so that tests running at the same
+    /// time, or a run that left a segment behind, don't share one.
+    fn test_topic(test: &str) -> String {
+        format!("/rust_ipc_test/{test}_{}", std::process::id())
+    }
+
+    /// Create the segment of `topic` as another process would and leave it
+    /// unsized. Returns its `shm_open` name and descriptor.
+    fn create_unsized(topic: &str) -> (Vec<u8>, c_int) {
+        let name = shm_open_name(topic);
+        let cname = CString::new(name.clone()).unwrap();
+        let fd = unsafe { shm_open(cname.as_ptr(), O_CREAT | O_EXCL | O_RDWR, 0o600) };
+        assert!(fd >= 0, "shm_open failed: errno {}", last_errno());
+        assert_eq!(segment_len(fd).unwrap(), 0);
+        (name, fd)
+    }
+
+    fn remove_segment(name: &[u8], fd: c_int) {
+        let cname = CString::new(name.to_vec()).unwrap();
+        unsafe {
+            close(fd);
+            libc::shm_unlink(cname.as_ptr());
+        }
+        #[cfg(target_os = "macos")]
+        forget_recorded_name(name);
+    }
+
+    #[test]
+    fn test_opens_a_segment_nobody_has_sized() {
+        // As if another process had created the segment and not sized it yet,
+        // or had died before sizing it. Before every process sized it, the
+        // write below raised SIGBUS on Linux, and macOS refused the mapping.
+        let topic = test_topic("unsized");
+        let (name, fd) = create_unsized(&topic);
+
+        let writer = IPC::<[u64; 4]>::new(&topic).expect("an unsized segment opens");
+        let needed = SeqLock::<[u64; 4]>::segment_size() as off_t;
+        assert!(segment_len(fd).unwrap() >= needed);
+        writer.set([1, 2, 3, 4]);
+
+        let mut reader = IPC::<[u64; 4]>::new(&topic).unwrap();
+        let mut value = [0; 4];
+        assert_eq!(reader.get(&mut value), IPCStatus::Success);
+        assert_eq!(value, [1, 2, 3, 4]);
+
+        drop((writer, reader));
+        remove_segment(&name, fd);
+    }
+
+    #[test]
+    fn test_late_sizing_keeps_a_tyndall_tailer() {
+        // This process created the segment and found it unsized. Before it
+        // sizes it, a C++ process sizes it to its own size and writes its
+        // tailer behind the record. Sizing to just the record would cut the
+        // tailer off on Linux.
+        let needed = SeqLock::<[u64; 4]>::segment_size();
+        let cpp_len = needed + TYNDALL_TAILER_ROOM - 1; // the largest tailer tyndall allows
+        let (name, fd) = create_unsized(&test_topic("late_sizing"));
+        assert_eq!(unsafe { ftruncate(fd, cpp_len as off_t) }, 0);
+        let map = unsafe {
+            mmap(
+                null_mut(),
+                cpp_len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(map, MAP_FAILED);
+        let tailer = unsafe {
+            std::slice::from_raw_parts_mut((map as *mut u8).add(needed), cpp_len - needed)
+        };
+        tailer.fill(0xa5);
+
+        let target = (needed + TYNDALL_TAILER_ROOM) as off_t;
+        let sized = ensure_sized(fd, 0, needed as off_t, target);
+        assert!(sized.is_ok(), "{sized:?}");
+        assert!(segment_len(fd).unwrap() >= cpp_len as off_t);
+        assert!(tailer.iter().all(|&b| b == 0xa5), "the tailer was cut off");
+
+        unsafe { munmap(map, cpp_len) };
+        remove_segment(&name, fd);
     }
 }
